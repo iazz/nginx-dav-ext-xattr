@@ -4,7 +4,9 @@ if [ -f auto/module ] ; then
 
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_dav_ext_module
-    ngx_module_libs=-lexpat
+    ngx_module_libs="-lexpat $(pkg-config --libs glib-2.0)"
+    ngx_module_incs="$(${PKG_CONFIG:=pkg-config} --cflags-only-I glib-2.0|
+		       sed -re 's/(^|\s)-I\s*(\S+)/\1\2/g')"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_dav_ext_module.c"
 
     . auto/module
@@ -12,5 +14,8 @@ if [ -f auto/module ] ; then
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_dav_ext_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_dav_ext_module.c"
-    CORE_LIBS="$CORE_LIBS -lexpat"
+    NGX_ADDON_INCS="$NGX_ADDON_INCS $(${PKG_CONFIG:=pkg-config} \
+		    --cflags-only-I glib-2.0|
+		    sed -re 's/(^|\s)-I\s*(\S+)/\1\2/g')"
+    CORE_LIBS="$CORE_LIBS -lexpat $(pkg-config --libs glib-2.0)"
 fi
