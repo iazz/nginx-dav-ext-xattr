@@ -1400,9 +1400,14 @@ ngx_http_dav_ext_propfind_handler(ngx_http_request_t *r)
 			ngx_http_dav_ext_start_xml_elt,
 			ngx_http_dav_ext_end_xml_elt);
 
-  for (c = r->request_body->bufs;
-       c != NULL && c->buf != NULL;
-       c = c->next) {
+  gboolean	body_present = FALSE;
+
+  for (c = r->request_body->bufs; c != NULL; c = c->next) {
+    if (c->buf == NULL)
+      continue;
+
+    body_present = TRUE;
+
     ngx_buf_t	*b = c->buf;
 
     if (!XML_Parse(parser, (const char *) b->pos,
@@ -1417,6 +1422,9 @@ ngx_http_dav_ext_propfind_handler(ngx_http_request_t *r)
   XML_ParserFree(parser);
 
   if (status == NGX_OK) {
+    if (!body_present)
+      /* No request XML provided, dump all properties. */
+      ctx->propfind = NGX_HTTP_DAV_EXT_PROPFIND_ALL;
     r->headers_out.status = 207;
     ngx_str_set(&r->headers_out.status_line, "207 Multi-Status");
     /* Add application/xml header required by RFC 4918. */
