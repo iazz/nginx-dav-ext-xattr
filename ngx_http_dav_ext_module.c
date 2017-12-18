@@ -675,6 +675,133 @@ ngx_http_dav_ext_xml_namespace_to_prefix
   return allocator->last_prefix;
 }
 
+/* Dump the requested xattr property of path.  Return
+   NGX_HTTP_NOT_FOUND if either name->data is NULL or the property is
+   not found. */
+static ngx_int_t
+ngx_http_dav_ext_send_propfind_xattr(ngx_http_request_t	*r,
+				     char		*path,
+				     ngx_chain_t	**ll,
+				     ngx_http_dav_ext_xml_prefix_allocator_t
+							*prefix_allocator,
+				     const ngx_str_t	*name)
+{
+  ngx_http_dav_ext_loc_conf_t  *delcf =
+    ngx_http_get_module_loc_conf(r, ngx_http_dav_ext_module);
+
+  size_t			value_buffer_len;
+  void				*value_buffer = NULL;
+
+  if (name->data == NULL)
+    goto not_found;
+
+#if (NGX_PCRE)
+  if (delcf->getxattr_filter.regexp.regex) {
+    if (ngx_regex_exec(delcf->getxattr_filter.regexp.regex, name, NULL, 0) < 0)
+      goto not_found;
+  }
+#endif /* (NGX_PCRE) */
+
+  /* Retrieve the size of the xattr. */
+  ssize_t	ret = getxattr(path, (const char *) name->data, NULL, 0);
+  if (ret == -1) {
+    if (errno == ENOATTR)
+      goto not_found;
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+
+  /* Retrieve the value of the xattr, by allocating a buffer of
+     the right size. */
+  do {
+    value_buffer_len = (size_t) ret;
+    void		*new_buffer = ngx_palloc(r->pool, value_buffer_len);
+    if (new_buffer == NULL)
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (value_buffer)
+      ngx_pfree(r->pool, value_buffer);
+    value_buffer = new_buffer;
+    ret = getxattr(path, (const char *) name->data,
+		   value_buffer, value_buffer_len);
+  } while (ret == -1 && errno == ERANGE);
+  if (ret == -1) {
+    if (errno == ENOATTR)
+      goto not_found;
+  }
+
+  /* Possibly shrink the buffer size. */
+  value_buffer_len = (size_t) ret;
+
+  /* Check whether the buffer contains only printable characters. */
+  const char	*p;
+  gboolean	printable = TRUE;
+  for (p = value_buffer;
+       (size_t)(p - (const char *) value_buffer) < value_buffer_len; ++p)
+    /* Printable characters would be those supported by XML (as
+       per section 2.2 of REC-xml-20081126) excluding those
+       larger than #x7f because they occupy more than one byte
+       in UTF-8 and excluding #x7e (DEL) as well, since that
+       would obviously not be readable. */
+    if (*p != '\t' && *p != '\n' && *p != '\r' &&
+	(*p < ' ' || *p > '~')) {
+      printable = FALSE;
+      break;
+    }
+
+  /* Allocate a prefix for the namespace if necessary. */
+  const char	*prefix = ngx_http_dav_ext_xml_namespace_to_prefix
+    (prefix_allocator, NGX_HTTP_DAV_EXT_XML_NS_XATTR);
+  if (prefix == NULL)
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+  size_t		prefix_len = strlen(prefix);
+
+  NGX_HTTP_DAV_EXT_OUTL("<");
+  NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
+  NGX_HTTP_DAV_EXT_OUTL(":getxattr ");
+  NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
+  NGX_HTTP_DAV_EXT_OUTL(":name=\"");
+  NGX_HTTP_DAV_EXT_OUTES(name);
+  NGX_HTTP_DAV_EXT_OUTL("\"");
+
+  if (printable)
+    NGX_HTTP_DAV_EXT_OUTL(" type=\"text/plain\">");
+  else
+    NGX_HTTP_DAV_EXT_OUTL(" type=\"application/base64\">");
+
+  if (!printable) {
+    /* The value has to be encoded in Base64. */
+    size_t	base64_len     = (value_buffer_len / 3 + 2) * 4;
+    char	*base64_buffer = ngx_palloc(r->pool, base64_len);
+    if (base64_buffer == NULL)
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    gint		state = 0;
+    gint		save  = 0;
+    gsize		base64_bytes =
+      g_base64_encode_step(value_buffer, value_buffer_len, FALSE,
+			   base64_buffer, &state, &save);
+    base64_bytes += g_base64_encode_close(FALSE,
+					  base64_buffer + base64_bytes,
+					  &state, &save);
+
+    NGX_HTTP_DAV_EXT_OUTEB((u_char *) base64_buffer, base64_bytes);
+    ngx_pfree(r->pool, base64_buffer);
+  } else
+    NGX_HTTP_DAV_EXT_OUTEB(value_buffer, value_buffer_len);
+
+  NGX_HTTP_DAV_EXT_OUTL("</");
+  NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
+  NGX_HTTP_DAV_EXT_OUTL(":getxattr>\n");
+
+  return NGX_OK;
+
+not_found:
+  if (value_buffer != NULL)
+    ngx_pfree(r->pool, value_buffer);
+
+  return NGX_HTTP_NOT_FOUND;
+}
+
 /* Add the requested properties to the output chain and any property
    that's not found to props_not_found for error reporting by the
    caller.  Prefixes are generated on-demand based on the
@@ -846,160 +973,114 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
 						  "supportedlock"))
       NGX_HTTP_DAV_EXT_OUTL("<D:supportedlock/>\n");
 
-    /* Don't dump other properties on allprop request. */
-    if (dump_all)
-      break;
-
     /*
      * getxattr
      */
-    if (ngx_http_dav_ext_xml_id_equal(&prop->id,
-				      NGX_HTTP_DAV_EXT_XML_NS_XATTR,
-				      "getxattr")) {
-      GList		*attr_link;
-      const char	*name = NULL;
+    if (dump_all || ngx_http_dav_ext_xml_id_equal(&prop->id,
+						  NGX_HTTP_DAV_EXT_XML_NS_XATTR,
+						  "getxattr")) {
+      size_t	name_buffer_len;
+      char	*name_buffer = NULL;
 
-      ngx_http_dav_ext_loc_conf_t  *delcf
-	= ngx_http_get_module_loc_conf(r, ngx_http_dav_ext_module);
-
+      if (dump_all) {
+	/* Retrieve the list of attribute names. */
+	ssize_t	ret = listxattr(path, NULL, 0);
+	if (ret == -1) {
+	  ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+			"dav_ext error getting list of extended attributes");
+	  return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	}
+	/* Allocate a buffer of the right size. */
+	do {
+	  name_buffer_len = (size_t) ret;
+	  char	*new_buffer = ngx_palloc(r->pool, name_buffer_len);
+	  if (new_buffer == NULL)
+	    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	  if (name_buffer != NULL)
+	    ngx_pfree(r->pool, name_buffer);
+	  name_buffer = new_buffer;
+	  ret = listxattr(path, name_buffer, name_buffer_len);
+	} while (ret == -1 && errno == ERANGE);
+	if (ret == -1) {
+	  ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+			"dav_ext error getting list of extended attributes");
+	  return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	}
+	name_buffer_len = (size_t) ret;
+	/* Check that the name buffer is null-terminated. */
+	if (name_buffer[name_buffer_len - 1] != 0) {
+	  ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+			"dav_ext list of extended attributes names is not"
+			" null-terminated");
+	  return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	}
+	/* Iterate over the attribute names. */
+	ngx_str_t	name = ngx_null_string;
+	for (name.len = strnlen(name_buffer, name_buffer_len),
+	       name.data = (u_char *) name_buffer;
+	     name.data < (u_char *) name_buffer + name_buffer_len;
+	     name.data += name.len + 1,
+	       name.len = strnlen((const char *) name.data,
+				  name_buffer_len
+				  - (size_t)(name.data
+					     - (u_char *) name_buffer))) {
+	  /* Try to dump the attribute value. */
+	  ngx_uint_t	code =
+	    ngx_http_dav_ext_send_propfind_xattr(r, path, ll,
+						 prefix_allocator, &name);
+	  switch (code) {
+	  case NGX_OK:
+	  case NGX_HTTP_NOT_FOUND:
+	    /* Whether the attribute was there or not makes no
+	       difference since we're in a allprop dump. */
+	    break;
+	  default:
+	    return code;
+	  }
+	}
+      } else { /* !dump_all */
 	/* Look for the name attribute. */
-      for (attr_link = g_queue_peek_head_link(&prop->attrs);
-	   attr_link != NULL; attr_link = attr_link->next) {
-	ngx_http_dav_ext_xml_attr_t	*attr = attr_link->data;
-	assert(attr != NULL);
-	if (ngx_http_dav_ext_xml_id_equal(&attr->id,
+	ngx_str_t	name = ngx_null_string;
+	GList		*attr_link;
+	for (attr_link = g_queue_peek_head_link(&prop->attrs);
+	     attr_link != NULL; attr_link = attr_link->next) {
+	  ngx_http_dav_ext_xml_attr_t	*attr = attr_link->data;
+	  assert(attr != NULL);
+	  if (ngx_http_dav_ext_xml_id_equal(&attr->id,
 					    NGX_HTTP_DAV_EXT_XML_NS_XATTR,
 					    "name")) {
-	  name = attr->value;
+	    name.data = (u_char *) attr->value;
+	    name.len  = strlen(attr->value);
+	    break;
+	  }
+	}
+
+	ngx_uint_t	code =
+	  ngx_http_dav_ext_send_propfind_xattr(r, path, ll,
+					       prefix_allocator, &name);
+
+	switch (code) {
+	case NGX_OK:
 	  break;
-	}
-      }
-
-      if (name == NULL)
-	goto not_found;
-
-#if (NGX_PCRE)
-      if (delcf->getxattr_filter.regexp.regex) {
-	ngx_str_t	input = { strlen(name), (u_char *) name };
-	if (ngx_regex_exec(delcf->getxattr_filter.regexp.regex,
-			   &input, NULL, 0) < 0)
-	  goto not_found;
-      }
-#endif /* (NGX_PCRE) */
-
-      /* Retrieve the size of the xattr. */
-      ssize_t	ret = getxattr(path, name, NULL, 0);
-      if (ret == -1) {
-	if (errno == ENOATTR)
-	  goto not_found;
-	return NGX_HTTP_INTERNAL_SERVER_ERROR;
-      }
-
-      /* Retrieve the value of the xattr, by allocating a buffer of
-	 the right size. */
-      size_t	buffer_len;
-      void	*buffer = NULL;
-      do {
-	buffer_len = (size_t) ret;
-	void		*new_buffer = realloc(buffer, buffer_len);
-	if (new_buffer == NULL) {
-	  free(buffer);
-	  return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
-	buffer = new_buffer;
-	ret = getxattr(path, name, buffer, buffer_len);
-      } while (ret == -1 && errno == ERANGE);
-
-      if (ret == -1) {
-	free(buffer);
-	if (errno == ENOATTR)
-	  goto not_found;
-      }
-
-      /* Possibly shrink the buffer size. */
-      buffer_len = (size_t) ret;
-
-      /* Check whether the buffer contains only printable characters. */
-      const char	*p;
-      gboolean	printable = TRUE;
-      for (p = buffer;
-	   (size_t)(p - (const char *) buffer) < buffer_len; ++p)
-	/* Printable characters would be those supported by XML (as
-	   per section 2.2 of REC-xml-20081126) excluding those
-	   larger than #x7f because they occupy more than one byte
-	   in UTF-8 and excluding #x7e (DEL) as well, since that
-	   would obviously not be readable. */
-	if (*p != '\t' && *p != '\n' && *p != '\r' &&
-	    (*p < ' ' || *p > '~')) {
-	  printable = FALSE;
-	  break;
-	}
-
-      /* Allocate a prefix for the namespace if necessary. */
-      const char	*prefix = ngx_http_dav_ext_xml_namespace_to_prefix
-	(prefix_allocator, NGX_HTTP_DAV_EXT_XML_NS_XATTR);
-      if (prefix == NULL) {
-	free(buffer);
-	return NGX_HTTP_INTERNAL_SERVER_ERROR;
-      }
-      size_t		prefix_len = strlen(prefix);
-
-      NGX_HTTP_DAV_EXT_OUTL("<");
-      NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
-      NGX_HTTP_DAV_EXT_OUTL(":getxattr ");
-      NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
-      NGX_HTTP_DAV_EXT_OUTL(":name=\"");
-      NGX_HTTP_DAV_EXT_OUTEB((u_char *) name, strlen(name));
-      NGX_HTTP_DAV_EXT_OUTL("\"");
-
-      if (printable)
-	NGX_HTTP_DAV_EXT_OUTL(" type=\"text/plain\">");
-      else
-	NGX_HTTP_DAV_EXT_OUTL(" type=\"application/base64\">");
-
-      if (!printable) {
-	/* The value has to be encoded in Base64. */
-	size_t	base64_len     = (buffer_len / 3 + 2) * 4;
-	char		*base64_buffer = malloc(base64_len);
-	if (base64_buffer == NULL) {
-	  free(buffer);
-	  return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	}
-
-	gint		state = 0;
-	gint		save  = 0;
-	gsize		base64_bytes = g_base64_encode_step
-	  (buffer, buffer_len, FALSE, base64_buffer, &state, &save);
-	base64_bytes += g_base64_encode_close(FALSE,
-					      base64_buffer + base64_bytes,
-					      &state, &save);
-
-	NGX_HTTP_DAV_EXT_OUTEB((u_char *) base64_buffer, base64_bytes);
-	free(base64_buffer);
-      } else
-	NGX_HTTP_DAV_EXT_OUTEB(buffer, buffer_len);
-
-      NGX_HTTP_DAV_EXT_OUTL("</");
-      NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
-      NGX_HTTP_DAV_EXT_OUTL(":getxattr>\n");
-
-      free(buffer);
-
-      /* The following code is not to be executed unless explicitly
-	 jumped into. */
-      if (0) {
-      not_found:
-	{
-	  /* Move the current property to props_not_found and get the
-	     next one. */
-	  GList	*prop_link_next = prop_link->next;
-	  g_queue_unlink(&ctx->props, prop_link);
-	  g_queue_push_tail_link(props_not_found, prop_link);
-	  prop_link = prop_link_next;
-	  continue;
+	case NGX_HTTP_NOT_FOUND:
+	  {
+	    /* Move the requested property to props_not_found and
+	       continue with the next property. */
+	    GList	*prop_link_next = prop_link->next;
+	    g_queue_unlink(&ctx->props, prop_link);
+	    g_queue_push_tail_link(props_not_found, prop_link);
+	    prop_link = prop_link_next;
+	    continue;
+	  }
+	default:
+	  return code;
 	}
       }
     }
+
+    /* Stop here if dumping all, we don't want to touch prop_link. */
+    if (dump_all)
+      break;
 
     prop_link = prop_link->next;
   }
