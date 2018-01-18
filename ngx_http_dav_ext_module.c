@@ -213,11 +213,17 @@ typedef struct {
 
 /* Context for the XML parser callbacks. */
 typedef struct {
-  /* Table of all named properties in the propfind. */
+  /* Table of all named properties in the propfind.
+   * contains elements of type ngx_http_dav_ext_xml_element_t */
   GQueue	props;
-  /* Which properties to return. */
+  /* Which properties to return :
+   * NGX_HTTP_DAV_EXT_PROPFIND_SELECTED: Return properties listed in props.
+   * NGX_HTTP_DAV_EXT_PROPFIND_NAMES: Return the name of all properties.
+   * NGX_HTTP_DAV_EXT_PROPFIND_ALL: Return all properties
+   */
   ngx_uint_t	propfind;
-  /* The queue of elements in the current path. */
+  /* The current stack of XML elements in the current parser run.
+   * contains elements of type ngx_http_dav_ext_xml_element_t */
   GQueue	elements;
   /* Whether parsing the XML has failed. */
   gboolean	failed;
@@ -834,10 +840,10 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
 
   GList		*prop_link;
 
-  /* Iterate on all requested properties. */
+  /* Either iterate on all requested properties, or if dump_all is set,
+   * iterate once and add all properties in one iteration. */
   for (prop_link = g_queue_peek_head_link(&ctx->props);
-       prop_link != NULL || dump_all;
-       /* prop_link = prop_link->next later */) {
+       prop_link != NULL || dump_all; prop_link = prop_link->next) {
 
     ngx_http_dav_ext_xml_element_t	*prop = dump_all? NULL: prop_link->data;
 
@@ -1064,12 +1070,9 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
 	  break;
 	case NGX_HTTP_NOT_FOUND:
 	  {
-	    /* Move the requested property to props_not_found and
-	       continue with the next property. */
-	    GList	*prop_link_next = prop_link->next;
-	    g_queue_unlink(&ctx->props, prop_link);
-	    g_queue_push_tail_link(props_not_found, prop_link);
-	    prop_link = prop_link_next;
+	    /* Add a reference to the requested property to props_not_found
+	     * and continue with the next property. */
+	    g_queue_push_tail(props_not_found, prop);
 	    continue;
 	  }
 	default:
@@ -1081,8 +1084,6 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
     /* Stop here if dumping all, we don't want to touch prop_link. */
     if (dump_all)
       break;
-
-    prop_link = prop_link->next;
   }
 
   return NGX_OK;
@@ -1213,8 +1214,6 @@ ngx_http_dav_ext_send_propfind_item(ngx_http_request_t	*r,
 	ngx_str_set(&status_line, "500 Internal Server Error");
 	break;
       }
-      g_queue_foreach(&props_not_found,
-		      (GFunc) ngx_http_dav_ext_xml_element_free, NULL);
       g_queue_clear(&props_not_found);
     }
   }
@@ -1260,8 +1259,9 @@ ngx_http_dav_ext_send_propfind_item(ngx_http_request_t	*r,
       NGX_HTTP_DAV_EXT_OUTCB((u_char *) prop->id.name,
 			     strlen(prop->id.name));
       GList	*attr_link;
-      while ((attr_link = g_queue_pop_head_link(&prop->attrs)) != NULL) {
-	ngx_http_dav_ext_xml_attr_t	*attr = attr_link->data;
+      for (attr_link = g_queue_peek_head_link(&prop->attrs);
+	   attr_link; attr_link = attr_link->next) {
+	const ngx_http_dav_ext_xml_attr_t	*attr = attr_link->data;
 	assert(attr != NULL);
 	NGX_HTTP_DAV_EXT_OUTL(" ");
 	if (attr->id.namespace[0] != '\0') {
@@ -1281,12 +1281,9 @@ ngx_http_dav_ext_send_propfind_item(ngx_http_request_t	*r,
 	NGX_HTTP_DAV_EXT_OUTL("=\"");
 	NGX_HTTP_DAV_EXT_OUTEB((u_char *) attr->value, strlen(attr->value));
 	NGX_HTTP_DAV_EXT_OUTL("\"");
-	ngx_http_dav_ext_xml_attr_free(attr);
-	g_list_free(attr_link);
       }
       NGX_HTTP_DAV_EXT_OUTL("/>\n");
     skip:
-      ngx_http_dav_ext_xml_element_free(prop);
       g_list_free(prop_link);
     }
 
