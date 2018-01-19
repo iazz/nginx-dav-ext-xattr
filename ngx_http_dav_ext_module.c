@@ -763,9 +763,7 @@ ngx_http_dav_ext_send_propfind_xattr(ngx_http_request_t	*r,
 
   NGX_HTTP_DAV_EXT_OUTL("<");
   NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
-  NGX_HTTP_DAV_EXT_OUTL(":getxattr ");
-  NGX_HTTP_DAV_EXT_OUTCB((u_char *) prefix, prefix_len);
-  NGX_HTTP_DAV_EXT_OUTL(":name=\"");
+  NGX_HTTP_DAV_EXT_OUTL(":getxattr name=\"");
   NGX_HTTP_DAV_EXT_OUTES(name);
   NGX_HTTP_DAV_EXT_OUTL("\"");
 
@@ -1052,9 +1050,7 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
 	     attr_link != NULL; attr_link = attr_link->next) {
 	  ngx_http_dav_ext_xml_attr_t	*attr = attr_link->data;
 	  assert(attr != NULL);
-	  if (ngx_http_dav_ext_xml_id_equal(&attr->id,
-					    NGX_HTTP_DAV_EXT_XML_NS_XATTR,
-					    "name")) {
+	  if (ngx_http_dav_ext_xml_id_equal(&attr->id, "", "name")) {
 	    name.data = (u_char *) attr->value;
 	    name.len  = strlen(attr->value);
 	    break;
