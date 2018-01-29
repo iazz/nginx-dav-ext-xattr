@@ -37,6 +37,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_hash.h>
 
 #include <sys/types.h>
 #include <attr/xattr.h>
@@ -806,6 +807,46 @@ not_found:
   return NGX_HTTP_NOT_FOUND;
 }
 
+/* Retrieve the Content-Type associated to the file extension ext
+   according to nginx' configuration.  The content_type argument is
+   used as output, its data and len fields are filled by the function. */
+static ngx_int_t
+ngx_http_dav_ext_get_content_type(ngx_http_request_t	*r,
+				  ngx_str_t		*ext,
+				  ngx_str_t		*content_type) {
+  static ngx_http_core_loc_conf_t	*clcf = NULL;
+
+  if (!clcf)
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+  ngx_uint_t				hash = 0;
+  ngx_uint_t				i;
+
+  for (i = 0; i < ext->len; ++i) {
+    if (ext->data[i] >= 'A' && ext->data[i] <= 'Z') {
+      u_char	*low_ext = ngx_pnalloc(r->pool, ext->len);
+      if (!low_ext)
+	return NGX_ERROR;
+      hash      = ngx_hash_strlow(low_ext, ext->data, ext->len);
+      ext->data = low_ext;
+      break;
+    }
+    hash = ngx_hash(hash, ext->data[i]);
+  }
+
+  ngx_str_t	*type = ngx_hash_find(&clcf->types_hash, hash,
+				      ext->data, ext->len);
+
+  if (type) {
+    *content_type = *type;
+    return NGX_OK;
+  }
+
+  *content_type = clcf->default_type;
+
+  return NGX_OK;
+}
+
 /* Add the requested properties to the output chain and any property
    that's not found to props_not_found for error reporting by the
    caller.  Prefixes are generated on-demand based on the
@@ -910,8 +951,34 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
      */
     if (dump_all || ngx_http_dav_ext_xml_id_equal(&prop->id,
 						  NGX_HTTP_DAV_EXT_XML_NS_DAV,
-						  "getcontenttype"))
-      NGX_HTTP_DAV_EXT_OUTL("<D:getcontenttype/>\n");
+						  "getcontenttype")) {
+      ngx_int_t	i;
+      ngx_str_t	ext = ngx_null_string;
+      size_t	path_len = strlen(path);
+
+      if (path_len > 1) {
+	for (i = path_len - 1; i > 1; --i) {
+	  if (path[i] == '.' && path[i - 1] != '/') {
+	    ext.data = (u_char *) &path[i + 1];
+	    ext.len  = path_len - i - 1;
+	    break;
+	  } else if (path[i] == '/')
+	    break;
+	}
+      }
+
+      ngx_str_t	type;
+
+      if (S_ISDIR(st.st_mode) ||
+	  path_len <= 1 ||
+	  ngx_http_dav_ext_get_content_type(r, &ext, &type) != NGX_OK)
+	NGX_HTTP_DAV_EXT_OUTL("<D:getcontenttype/>\n");
+      else {
+	NGX_HTTP_DAV_EXT_OUTL("<D:getcontenttype>");
+	NGX_HTTP_DAV_EXT_OUTES(&type);
+	NGX_HTTP_DAV_EXT_OUTL("</D:getcontenttype>\n");
+      }
+    }
 
     /*
      * getetag
