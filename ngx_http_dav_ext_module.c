@@ -40,7 +40,7 @@
 #include <ngx_hash.h>
 
 #include <sys/types.h>
-#include <attr/xattr.h>
+#include <sys/xattr.h>
 #include <dirent.h>
 #include <time.h>
 #include <stdlib.h>
@@ -712,7 +712,7 @@ ngx_http_dav_ext_send_propfind_xattr(ngx_http_request_t	*r,
   /* Retrieve the size of the xattr. */
   ssize_t	ret = getxattr(path, (const char *) name->data, NULL, 0);
   if (ret == -1) {
-    if (errno == ENOATTR)
+    if (errno == ENODATA)
       goto not_found;
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
@@ -731,7 +731,7 @@ ngx_http_dav_ext_send_propfind_xattr(ngx_http_request_t	*r,
 		   value_buffer, value_buffer_len);
   } while (ret == -1 && errno == ERANGE);
   if (ret == -1) {
-    if (errno == ENOATTR)
+    if (errno == ENODATA)
       goto not_found;
   }
 
