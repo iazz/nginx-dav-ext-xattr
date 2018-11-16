@@ -867,9 +867,19 @@ ngx_http_dav_ext_send_propfind_atts(ngx_http_request_t	*r,
 
 
   if (stat(path, &st)) {
+    ngx_int_t ret;
+    switch (ngx_errno) {
+    case ENOENT:
+    case ENOTDIR:
+    case ENAMETOOLONG:
+      ret = NGX_HTTP_NOT_FOUND;
+      break;
+    default:
+      ret = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
 		  "dav_ext stat failed on '%s'", path);
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return ret;
   }
 
   ngx_http_dav_ext_ctx_t	*ctx =
@@ -1272,6 +1282,9 @@ ngx_http_dav_ext_send_propfind_item(ngx_http_request_t	*r,
       switch (code) {
       case NGX_HTTP_BAD_REQUEST:
 	ngx_str_set(&status_line, "400 Bad Request");
+	break;
+      case NGX_HTTP_NOT_FOUND:
+	ngx_str_set(&status_line, "404 Not Found");
 	break;
       default:
 	ngx_str_set(&status_line, "500 Internal Server Error");
